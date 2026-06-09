@@ -1,0 +1,513 @@
+"""
+============================================================
+  Phase Field Crystal (PFC) Simulation — Upgraded
+  Crystal Growth with Stochastic Noise + Dataset Generation
+
+  Based on: elvissoares/PyPFC (github.com/elvissoares/PyPFC)
+  Modified by: Ayush Shah & Tobias Li
+  Georgia Institute of Technology
+  NSF IRES Physical AI Design Program — Prof. Bo Zhu
+
+  Changes from baseline:
+    - Langevin thermal noise for stochastic/irregular growth
+    - Parameterized via os.environ for automated sweeping
+    - Saves FNO-ready .npz trajectories to Google Drive
+    - Skips already-completed runs (safe to resume)
+    - Writes manifest.csv logging every run's metadata
+    - Multi-seed initial condition option added
+============================================================
+"""
+
+# ── Cell 1: Imports ───────────────────────────────────────────────────────────
+import numpy as np
+from scipy.fft import fft2, ifft2
+from matplotlib import pyplot as plt
+from matplotlib import animation
+from matplotlib.colors import LinearSegmentedColormap
+from scipy import ndimage
+import os, csv, time, itertools
+
+plt.rcParams.update({
+    "figure.dpi": 120,
+    "font.family": "serif",
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+})
+print("Libraries loaded.")
+
+# ── Cell 2: Mount Google Drive ────────────────────────────────────────────────
+# Run this once at the start of your Colab session.
+# All trajectory .npz files and the manifest.csv will be saved here.
+# Comment out if running locally.
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+SAVE_DIR = '/content/drive/MyDrive/pfc_dataset'
+os.makedirs(SAVE_DIR, exist_ok=True)
+print(f"Save directory: {SAVE_DIR}")
+
+# ── Cell 3: Single-run function ───────────────────────────────────────────────
+# Everything is wrapped in run_pfc() so the sweep loop (Cell 5) can call it
+# 36 times in one Colab session without restarting the kernel.
+
+def run_pfc(r, n0, seed_type, noise_strength, run_id, save_dir,
+            N=128, T=250.0, dt=0.25, save_every=25, M=1.0,
+            show_plots=False):
+    """
+    Run one PFC simulation and save an FNO-ready .npz file.
+
+    Parameters
+    ----------
+    r              : float  — temperature param (more negative = faster growth)
+                              typical range: -0.25 to -0.33
+    n0             : float  — mean density (controls crystal phase)
+                              typical range: -0.27 to -0.30
+    seed_type      : str    — 'hex', 'point', or 'multi'
+    noise_strength : float  — Langevin noise amplitude (0 = deterministic)
+                              0.0   → perfectly uniform, clean hexagonal growth
+                              0.005 → subtle grain irregularity (recommended)
+                              0.02  → strong branching / dendritic growth
+    run_id         : str    — zero-padded ID string, e.g. '0007'
+    save_dir       : str    — path to save .npz (Google Drive folder)
+    N              : int    — grid points per side
+    T              : float  — total simulation time
+    dt             : float  — timestep
+    save_every     : int    — save one frame every this many steps
+    M              : float  — mobility (leave at 1.0)
+    show_plots     : bool   — set True to display plots inline (slow in sweep)
+
+    Saves
+    -----
+    <save_dir>/traj_<run_id>.npz  containing:
+        frames         (T_frames, N, N) float32  — full trajectory
+        fno_inputs     (T_frames-1, N, N) float32 — frame_t  for FNO training
+        fno_targets    (T_frames-1, N, N) float32 — frame_t+1 for FNO training
+        params         (4,) float32  — [r, n0, noise_strength, dt*save_every]
+        seed_type      bytes
+        phi_c          float32  — percolation threshold (-1 if not found)
+        free_energy    (T_frames,) float32  — F(t)/L^2 at each saved frame
+        t_values       (T_frames,) float32  — time at each saved frame
+
+    Returns
+    -------
+    phi_c : float or None
+    """
+
+    out_path = os.path.join(save_dir, f'traj_{run_id}.npz')
+    if os.path.exists(out_path):
+        print(f"  [skip] traj_{run_id}.npz already exists.")
+        return None
+
+    print(f"\n{'='*60}")
+    print(f"  RUN {run_id}  |  r={r}  n0={n0}  seed={seed_type}  noise={noise_strength}")
+    print(f"{'='*60}")
+
+    # ── Grid and Fourier setup ────────────────────────────────
+    L    = 16 * np.pi
+    x    = np.linspace(0, L, N, endpoint=False)
+    dx   = x[1] - x[0]
+
+    Nsteps  = int(T / dt)
+    Nframes = Nsteps // save_every
+
+    kx = np.fft.fftfreq(N, d=dx) * 2 * np.pi
+    k  = np.array(np.meshgrid(kx, kx, indexing='ij'), dtype=np.float32)
+    k2 = np.sum(k * k, axis=0, dtype=np.float32)
+
+    kmax_dealias = kx.max() * 2.0 / 3.0
+    dealias = np.array(
+        (np.abs(k[0]) < kmax_dealias) * (np.abs(k[1]) < kmax_dealias),
+        dtype=bool
+    )
+
+    # Linear operator (depends on r, recomputed per run)
+    L_operator   = -M * k2 * (k2**2 - 2*k2 + 1 + r)
+    linear_denom = 1.0 / (1.0 - dt * L_operator)
+
+    # ── Nonlinear operator ────────────────────────────────────
+    def nonlinear_operator(n_field):
+        return -(k2 * M * fft2(n_field**3)) * dealias
+
+    # ── Initial condition ─────────────────────────────────────
+    # Seed for this run derived from run_id so each run is reproducible
+    # but different seeds give different noise realisations
+    seed_int = int(run_id) if run_id.isdigit() else 42
+    rng = np.random.default_rng(seed_int)
+
+    SX, SY = np.meshgrid(np.arange(N), np.arange(N), indexing='ij')
+    k0_phys = 2 * np.pi / (4 * dx)
+
+    # Background: uniform liquid + tiny thermal fluctuations
+    n_init = n0 + 0.01 * rng.standard_normal((N, N))
+
+    def hex_seed(cx, cy, radius_frac=0.10, amplitude=0.20):
+        """Plant one hexagonal crystal seed centred at (cx, cy)."""
+        sigma  = (N * radius_frac) ** 2
+        R2_loc = (SX - cx)**2 + (SY - cy)**2
+        env    = np.exp(-R2_loc / (2 * sigma))
+        pat    = (
+            np.cos(k0_phys * x[SX]) +
+            2 * np.cos(0.5 * k0_phys * x[SX]) *
+                np.cos(np.sqrt(3)/2 * k0_phys * x[SY])
+        )
+        return amplitude * env * pat
+
+    if seed_type == 'hex':
+        # Single hexagonal seed at centre
+        n_init += hex_seed(N // 2, N // 2)
+
+    elif seed_type == 'point':
+        # Tight Gaussian bump — no pre-imposed lattice, nucleates organically
+        R2_c    = (SX - N // 2)**2 + (SY - N // 2)**2
+        n_init += 0.30 * np.exp(-R2_c / (2 * (N // 20)**2))
+
+    elif seed_type == 'multi':
+        # 4 hexagonal seeds at random positions (away from edges)
+        margin = N // 5
+        for _ in range(4):
+            sx = rng.integers(margin, N - margin)
+            sy = rng.integers(margin, N - margin)
+            n_init += hex_seed(sx, sy, radius_frac=0.07, amplitude=0.18)
+
+    # ── Storage ───────────────────────────────────────────────
+    n_all = np.zeros((Nframes, N, N), dtype=np.float32)
+    n_all[0] = n_init.astype(np.float32)
+
+    # ── Time integration ──────────────────────────────────────
+    nn       = n_init.copy()
+    n_hat    = fft2(nn).astype(np.complex64)
+    NL_hat   = np.empty_like(n_hat)
+
+    frame_idx = 1
+    t0 = time.time()
+
+    for i in range(1, Nsteps):
+        NL_hat[:] = nonlinear_operator(nn)
+        n_hat[:]  = (n_hat + dt * NL_hat) * linear_denom
+
+        # ── LANGEVIN THERMAL NOISE ────────────────────────────
+        # Add stochastic forcing in Fourier space after each semi-implicit step.
+        # Scaled so that noise_strength=0 recovers the deterministic baseline.
+        # The sqrt(2*noise_strength/dt) factor ensures correct fluctuation
+        # amplitude relative to the timestep size.
+        # Effect:
+        #   noise_strength = 0.000 → deterministic, perfectly uniform growth
+        #   noise_strength = 0.005 → subtle grain irregularity (recommended)
+        #   noise_strength = 0.015 → visible branching and dendritic tips
+        #   noise_strength = 0.030 → strong disorder, organic/biological look
+        if noise_strength > 0:
+            # Add noise in real space — much safer, avoids Fourier-space amplification
+            scale  = noise_strength
+            n_hat += fft2(scale * rng.standard_normal((N, N)).astype(np.float32))
+    
+            # NaN guard — if solver blew up, abort this run early
+            if not np.isfinite(n_hat).all():
+                print(f"  ⚠ NaN detected at step {i}, aborting run")
+                return -1.0
+
+        nn[:] = ifft2(n_hat).real
+
+        if i % save_every == 0 and frame_idx < Nframes:
+            n_all[frame_idx] = nn.astype(np.float32)
+            elapsed = time.time() - t0
+            pct     = 100 * i / Nsteps
+            print(f"  {pct:5.1f}%  step {i:5d}/{Nsteps}  "
+                  f"field=[{nn.min():.3f},{nn.max():.3f}]  "
+                  f"{elapsed:.0f}s", end='\r')
+            frame_idx += 1
+
+    print(f"\n  Done in {time.time()-t0:.1f}s  |  frames={frame_idx}")
+
+    # Mass conservation check
+    drift = abs(n_all[frame_idx-1].mean() / n_all[0].mean() - 1) * 100
+    print(f"  Mass drift: {drift:.4f}%  {'✓' if drift < 0.05 else '⚠ HIGH'}")
+
+    # ── Free energy ───────────────────────────────────────────
+    F_vals = np.zeros(frame_idx, dtype=np.float32)
+    for i in range(frame_idx):
+        nh      = fft2(n_all[i])
+        lapn    = ifft2(-k2 * nh).real
+        laplapn = ifft2(k2**2 * nh).real
+        F_vals[i] = np.sum(
+            n_all[i] * (lapn + 0.5 * laplapn)
+            + 0.5 * (1 + r) * n_all[i]**2
+            + 0.25 * n_all[i]**4
+        ) * dx**2 / L**2
+    t_values = np.arange(frame_idx, dtype=np.float32) * save_every * dt
+
+    # ── Grain extraction + percolation ────────────────────────
+    final     = n_all[frame_idx - 1]
+    ring_mask = (k2 > (0.5 * k0_phys)**2) & (k2 < (1.5 * k0_phys)**2)
+    n_crystal = np.real(ifft2(fft2(final) * ring_mask))
+    amplitude = ndimage.gaussian_filter(np.abs(n_crystal), sigma=3.0)
+    amplitude /= (amplitude.max() + 1e-12)
+
+    thresholds  = np.linspace(0.05, 0.95, 80)
+    perc_flags  = []
+    for thresh in thresholds:
+        mask          = amplitude > thresh
+        lbl, _        = ndimage.label(mask)
+        top_grains    = set(lbl[0,  :].ravel()) - {0}
+        bottom_grains = set(lbl[-1, :].ravel()) - {0}
+        left_grains   = set(lbl[:,  0].ravel()) - {0}
+        right_grains  = set(lbl[:, -1].ravel()) - {0}
+        percolates    = bool(top_grains & bottom_grains) or \
+                        bool(left_grains & right_grains)
+        perc_flags.append(int(percolates))
+
+    perc_flags = np.array(perc_flags)
+    crossing   = np.where(np.diff(perc_flags) != 0)[0]
+    phi_c      = float(thresholds[crossing[0]]) if len(crossing) > 0 else -1.0
+    print(f"  phi_c = {phi_c:.3f}" if phi_c > 0 else "  phi_c: not found")
+
+    # ── Build FNO training pairs ──────────────────────────────
+    # The FNO learns: given frame_t → predict frame_t+1
+    # fno_inputs[i]  = n_all[i]
+    # fno_targets[i] = n_all[i+1]
+    # Shape: (frame_idx-1, N, N) — every consecutive pair
+    fno_inputs  = n_all[:frame_idx - 1].copy()   # frames 0 … T-2
+    fno_targets = n_all[1:frame_idx].copy()       # frames 1 … T-1
+
+    # ── Save .npz ─────────────────────────────────────────────
+    np.savez_compressed(
+        out_path,
+        # Full trajectory (needed for visualization and rollout fine-tuning)
+        frames      = n_all[:frame_idx],           # (T, N, N) float32
+        # FNO training pairs (ready to load directly into a DataLoader)
+        fno_inputs  = fno_inputs,                  # (T-1, N, N) float32
+        fno_targets = fno_targets,                 # (T-1, N, N) float32
+        # Run metadata
+        params      = np.array([r, n0, noise_strength, dt * save_every],
+                                dtype=np.float32), # [r, n0, noise, dt_eff]
+        seed_type   = np.bytes_(seed_type),
+        phi_c       = np.float32(phi_c),
+        free_energy = F_vals,                      # (T,) float32
+        t_values    = t_values,                    # (T,) float32
+    )
+    print(f"  Saved → {out_path}")
+
+    # ── Optional plots ────────────────────────────────────────
+    if show_plots:
+        cmap_pfc = LinearSegmentedColormap.from_list("pfc", [
+            (0.00, "#0a1628"), (0.35, "#1a3a6b"),
+            (0.58, "#c8a84b"), (0.78, "#e8d5a3"), (1.00, "#ffffff"),
+        ])
+        vmin = np.percentile(final, 2)
+        vmax = np.percentile(final, 98)
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        axes[0].imshow(n_all[0], cmap=cmap_pfc, origin='lower',
+                       vmin=vmin, vmax=vmax)
+        axes[0].set_title(f"t=0  seed={seed_type}")
+
+        axes[1].imshow(final, cmap=cmap_pfc, origin='lower',
+                       vmin=vmin, vmax=vmax)
+        axes[1].set_title(f"t={T:.0f}  r={r}  n0={n0}")
+
+        axes[2].plot(t_values, F_vals, color='#1a3a6b', lw=2)
+        axes[2].set_title("Free Energy")
+        axes[2].set_xlabel("t"); axes[2].grid(True, alpha=0.3)
+
+        fig.suptitle(f"Run {run_id}  |  noise={noise_strength}  phi_c={phi_c:.3f}",
+                     fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+    return phi_c
+
+
+# ── Cell 4: Manifest helper ───────────────────────────────────────────────────
+def log_to_manifest(save_dir, run_id, r, n0, seed_type, noise_strength, phi_c):
+    """Append one row to manifest.csv. Creates the file with header if needed."""
+    manifest_path = os.path.join(save_dir, 'manifest.csv')
+    write_header  = not os.path.exists(manifest_path)
+    with open(manifest_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(['run_id', 'r', 'n0', 'seed_type',
+                             'noise_strength', 'phi_c'])
+        writer.writerow([run_id, r, n0, seed_type, noise_strength,
+                         f'{phi_c:.4f}' if phi_c and phi_c > 0 else 'nan'])
+    print(f"  Manifest updated: {manifest_path}")
+
+
+# ── Cell 5: Parameter sweep ───────────────────────────────────────────────────
+# This is the main sweep. All 36 runs execute in one Colab session.
+# Already-saved runs are skipped automatically — safe to re-run after a crash.
+#
+# Total runs: 4 r × 3 n0 × 3 seeds = 36
+# Estimated time: ~3 min/run × 36 = ~108 min on Colab CPU
+# Tip: run in batches of 12 if you're worried about session timeout.
+#      Just change start_idx below and re-run.
+
+r_values      = [-0.25, -0.28, -0.30, -0.33]
+n0_values     = [-0.27, -0.285, -0.30]
+seed_types    = ['hex', 'point', 'multi']
+
+# Noise strength: single value applied to all runs.
+# 0.005 gives subtle, realistic irregularity without destabilising the solver.
+# Increase to 0.015 for more visually dramatic dendritic/branching growth.
+NOISE_STRENGTH = 0.0005
+
+configs    = list(itertools.product(r_values, n0_values, seed_types))
+start_idx  = 0   # change this to resume from a specific run index
+total_runs = len(configs)
+
+print(f"Total runs: {total_runs}  |  Starting from index {start_idx}")
+print(f"Noise strength: {NOISE_STRENGTH}")
+print(f"Saving to: {SAVE_DIR}\n")
+
+sweep_t0 = time.time()
+
+for i, (r_val, n0_val, seed_val) in enumerate(configs[start_idx:],
+                                               start=start_idx):
+    run_id = f'{i:04d}'
+
+    phi_c = run_pfc(
+        r              = r_val,
+        n0             = n0_val,
+        seed_type      = seed_val,
+        noise_strength = NOISE_STRENGTH,
+        run_id         = run_id,
+        save_dir       = SAVE_DIR,
+        show_plots     = False,   # set True to preview individual runs
+    )
+
+    if phi_c is not None:  # None means it was skipped
+        log_to_manifest(SAVE_DIR, run_id, r_val, n0_val, seed_val,
+                        NOISE_STRENGTH, phi_c)
+
+    elapsed_total = (time.time() - sweep_t0) / 60
+    runs_done     = i - start_idx + 1
+    runs_left     = total_runs - start_idx - runs_done
+    eta_min       = (elapsed_total / runs_done) * runs_left if runs_done else 0
+    print(f"  Progress: {runs_done}/{total_runs - start_idx} runs  |  "
+          f"Elapsed: {elapsed_total:.1f}min  |  ETA: {eta_min:.1f}min\n")
+
+print(f"\n{'='*60}")
+print(f"Sweep complete in {(time.time()-sweep_t0)/60:.1f} min")
+print(f"Files saved to: {SAVE_DIR}")
+
+
+# ── Cell 6: Verify saved data ─────────────────────────────────────────────────
+# Run this after the sweep to confirm files look correct before FNO training.
+
+print("\nVerifying saved dataset...\n")
+
+import glob
+files = sorted(glob.glob(os.path.join(SAVE_DIR, 'traj_*.npz')))
+print(f"Files found: {len(files)}\n")
+
+for fpath in files[:3]:  # inspect first 3 as a spot check
+    d = np.load(fpath, allow_pickle=True)
+    print(f"  {os.path.basename(fpath)}")
+    print(f"    frames:      {d['frames'].shape}   dtype={d['frames'].dtype}")
+    print(f"    fno_inputs:  {d['fno_inputs'].shape}")
+    print(f"    fno_targets: {d['fno_targets'].shape}")
+    print(f"    params:      r={d['params'][0]:.3f}  n0={d['params'][1]:.3f}  "
+          f"noise={d['params'][2]:.4f}  dt_eff={d['params'][3]:.2f}")
+    print(f"    seed_type:   {d['seed_type']}")
+    print(f"    phi_c:       {d['phi_c']:.4f}")
+    print(f"    free_energy: {d['free_energy'].shape}  "
+          f"range=[{d['free_energy'].min():.4f}, {d['free_energy'].max():.4f}]")
+
+    # Sanity check: energy must be monotonically decreasing
+    fe = d['free_energy']
+    if np.all(np.diff(fe) <= 1e-6):
+        print(f"    energy check: ✓ monotonically decreasing")
+    else:
+        n_violations = np.sum(np.diff(fe) > 1e-6)
+        print(f"    energy check: ⚠ {n_violations} non-monotone steps")
+
+    # Sanity check: mass conservation
+    frames = d['frames']
+    drift  = abs(frames[-1].mean() / frames[0].mean() - 1) * 100
+    print(f"    mass drift:  {drift:.4f}%  {'✓' if drift < 0.05 else '⚠'}\n")
+
+# Print full manifest
+manifest_path = os.path.join(SAVE_DIR, 'manifest.csv')
+if os.path.exists(manifest_path):
+    print(f"Manifest ({manifest_path}):")
+    with open(manifest_path) as f:
+        for line in f:
+            print("  " + line.strip())
+
+
+# ── Cell 7: PyTorch Dataset class (copy into your FNO training notebook) ──────
+# This shows exactly how to load the saved data for FNO training next week.
+# You do NOT need to run this in the data generation notebook.
+# Copy Cell 7 into your Week 2 FNO training notebook as the starting point.
+
+DATASET_EXAMPLE = '''
+# ── FNO Training Notebook: Dataset Loader ────────────────────
+# Paste this into your Week 2 notebook.
+# Requires: torch, numpy, glob
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np, glob, os
+
+class PFCDataset(Dataset):
+    """
+    Loads all FNO training pairs from the saved .npz files.
+
+    Each item is (input_frame, target_frame) — consecutive snapshots.
+    Shape per item: (1, N, N) — channel dim added for Conv2D compatibility.
+
+    Usage
+    -----
+    dataset    = PFCDataset('/content/drive/MyDrive/pfc_dataset')
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    for inputs, targets in dataloader:
+        # inputs:  (B, 1, N, N) float32
+        # targets: (B, 1, N, N) float32
+        pred = fno_model(inputs)
+        loss = criterion(pred, targets)
+        ...
+    """
+    def __init__(self, data_dir, normalize=True):
+        self.pairs = []     # list of (input_frame, target_frame) arrays
+        self.normalize = normalize
+
+        files = sorted(glob.glob(os.path.join(data_dir, 'traj_*.npz')))
+        print(f"Loading {len(files)} trajectory files...")
+
+        all_inputs, all_targets = [], []
+        for fpath in files:
+            d = np.load(fpath)
+            all_inputs.append(d['fno_inputs'])    # (T-1, N, N)
+            all_targets.append(d['fno_targets'])  # (T-1, N, N)
+
+        # Stack all runs: (total_pairs, N, N)
+        inputs  = np.concatenate(all_inputs,  axis=0)
+        targets = np.concatenate(all_targets, axis=0)
+
+        if normalize:
+            # Normalize to [-1, 1] using global stats across all frames
+            self.mean = inputs.mean()
+            self.std  = inputs.std() + 1e-8
+            inputs    = (inputs  - self.mean) / self.std
+            targets   = (targets - self.mean) / self.std
+
+        # Add channel dim: (total_pairs, 1, N, N)
+        self.inputs  = torch.tensor(inputs[:,  None, :, :], dtype=torch.float32)
+        self.targets = torch.tensor(targets[:, None, :, :], dtype=torch.float32)
+
+        print(f"Dataset: {len(self.inputs)} pairs  |  "
+              f"shape={tuple(self.inputs.shape[1:])}  |  "
+              f"mean={self.mean:.4f}  std={self.std:.4f}")
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        return self.inputs[idx], self.targets[idx]
+'''
+
+print("\n" + "="*60)
+print("Cell 7: PyTorch Dataset class for FNO training (Week 2)")
+print("Copy the code block below into your FNO training notebook.")
+print("="*60)
+print(DATASET_EXAMPLE)
